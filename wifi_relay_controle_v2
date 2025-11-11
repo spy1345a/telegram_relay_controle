@@ -1,0 +1,332 @@
+#include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
+#include "time.h"
+
+
+//structure how the time is stored
+struct Schedule {
+  int startHour;
+  int startMinute;
+};
+
+//arrey that stores the time for scedule
+Schedule relaySchedule[] = {
+  {6, 0},  // Turn ON at 6:00 AM → auto OFF after 1 hour
+  {8, 0},  // Turn ON at 8:00 AM → auto OFF after 1 hour
+  {10,0},  // Turn ON at 10:00 AM → auto OFF after 1 hour
+  {12,0},  // Turn ON at 12:00 AM → auto OFF after 1 hour
+  {14,0},  // Turn ON at 2:00 AM → auto OFF after 1 hour
+};
+
+//realy pin
+const int relayPin = D1;
+
+// WiFi credentials
+const char* ssid = "<WIFI_NAME>";
+const char* password = "<WIFI_PASSWORD>";
+
+// Telegram Bot credentials
+const char* botToken = "<Telegram_BOT_API>";
+const char* chatID = "<Telegram_Group_ID>";
+
+//Time config
+const long gmtOffset_sec = 19800;   // for India (UTC+5:30)
+const int daylightOffset_sec = 0;
+
+// Variable to store last update ID
+long lastUpdateID = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  
+  // Connect to WiFi
+  connectToWiFi();
+
+  //Setting realy to off
+  digitalWrite(relayPin, HIGH);
+
+  //configeing time
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+  String currentTime = getCurrentTimeString();
+  Serial.println("Time configured via NTP");
+
+  // Test Telegram connection
+  if (WiFi.status() == WL_CONNECTED) {
+    sendTelegramMessage("System Booted🟢%0ATime: "+currentTime);
+  }
+}
+
+void loop() {
+  // Check for new Telegram messages every 3 secconds due to telegram api rate limite
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 3000) {
+    lastCheck = millis();
+    readTelegramCommands();
+    configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+  }
+  
+  if (checkSchedule()) {
+  controlRelay();
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+  }
+
+  delay(1000);
+}
+
+// Function to connect to WiFi
+void connectToWiFi() {
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  
+  // Start WiFi connection
+  WiFi.begin(ssid, password);
+  
+  // Wait for connection
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  // Check if connected
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Signal Strength (RSSI): ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+  } else {
+    Serial.println();
+    Serial.println("Connection failed!");
+    Serial.println("Please check your WiFi credentials.");
+  }
+}
+
+// Function to send message to Telegram
+void sendTelegramMessage(String message) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected. Cannot send Telegram message.");
+    return;
+  }
+
+  // Replace newlines with %0A (URL encoding for newline)
+  message.replace("\n", "%0A");
+
+  WiFiClientSecure client;
+  client.setInsecure(); // Skips certificate check (fine for testing)
+  
+  Serial.println("Connecting to Telegram...");
+
+  if (client.connect("api.telegram.org", 443)) {
+    Serial.println("Connected to Telegram!");
+    
+    // Build URL safely
+    String url = "/bot" + String(botToken) + "/sendMessage?chat_id=" + String(chatID) + "&text=" + message;
+
+    // Send HTTP GET request
+    client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+                 "Host: api.telegram.org\r\n" +
+                 "Connection: close\r\n\r\n");
+
+    // Wait for response
+    unsigned long timeout = millis();
+    while (client.available() == 0) {
+      if (millis() - timeout > 5000) {
+        Serial.println("Timeout!");
+        client.stop();
+        return;
+      }
+    }
+
+    // Print Telegram response
+    Serial.println("Response from Telegram:");
+    while (client.available()) {
+      String line = client.readStringUntil('\r');
+      Serial.print(line);
+    }
+    Serial.println("\nMessage sent to Telegram!");
+    
+    client.stop();
+  } else {
+    Serial.println("Connection to Telegram failed!");
+  }
+}
+
+// Function to read Telegram commands
+void readTelegramCommands() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  if (client.connect("api.telegram.org", 443)) {
+    String url = "/bot" + String(botToken) + "/getUpdates?offset=" + String(lastUpdateID + 1) + "&limit=1";
+
+    client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+                 "Host: api.telegram.org\r\n" +
+                 "Connection: close\r\n\r\n");
+
+    unsigned long timeout = millis();
+    while (client.available() == 0) {
+      if (millis() - timeout > 5000) {
+        client.stop();
+        return;
+      }
+    }
+
+    String response = "";
+    bool bodyStarted = false;
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      if (line == "\r") {
+        bodyStarted = true;
+      }
+      if (bodyStarted) {
+        response += line;
+      }
+    }
+
+    client.stop();
+
+    if (response.length() > 0) {
+      int updateIDIndex = response.indexOf("\"update_id\":");
+      if (updateIDIndex != -1) {
+        int idStart = updateIDIndex + 12;
+        int idEnd = response.indexOf(",", idStart);
+        String updateIDStr = response.substring(idStart, idEnd);
+        long newUpdateID = updateIDStr.toInt();
+
+        if (newUpdateID > lastUpdateID) {
+          lastUpdateID = newUpdateID;
+
+          // ---- Get message timestamp ----
+          int dateIndex = response.indexOf("\"date\":");
+          bool isValidTime = false;
+
+          if (dateIndex != -1) {
+            int dateStart = dateIndex + 7;
+            int dateEnd = response.indexOf(",", dateStart);
+            String dateStr = response.substring(dateStart, dateEnd);
+            unsigned long msgTime = dateStr.toInt();  // Telegram time (epoch seconds)
+            unsigned long now = (unsigned long)time(nullptr);
+
+            const unsigned long VALID_WINDOW = 30;  // seconds
+            unsigned long age = now - msgTime;
+
+            if (age <= VALID_WINDOW) {
+              isValidTime = true;
+            } else {
+              Serial.print("Ignoring old command (");
+              Serial.print(age);
+              Serial.println("s old)");
+            }
+          }
+
+          if (!isValidTime) {
+            return;  // Skip processing old commands
+          }
+
+          // ---- Extract command text ----
+          int textIndex = response.indexOf("\"text\":\"");
+          if (textIndex != -1) {
+            int textStart = textIndex + 8;
+            int textEnd = response.indexOf("\"", textStart);
+            String command = response.substring(textStart, textEnd);
+
+            Serial.print("Received command: ");
+            Serial.println(command);
+
+            if (command == "/on") {
+              handleOnCommand();
+            } else if (command == "/status") {
+              handleStatusCommand();
+            } else {
+              sendTelegramMessage("Unknown command. Use /on, /off, or /status");
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+
+// Handle /on command
+void handleOnCommand() {
+  Serial.println("ON command received!");
+  controlRelay();
+}
+
+// Handle /status command
+void handleStatusCommand() {
+  Serial.println("STATUS command received!");
+  
+  String statusMsg = "ESP8266 Status:\n";
+  statusMsg += "WiFi: Connected\n";
+  statusMsg += "IP: " + WiFi.localIP().toString() + "\n";
+  statusMsg += "Signal: " + String(WiFi.RSSI()) + " dBm";
+  
+  sendTelegramMessage(statusMsg);
+}
+
+//Handels the relay on, auto turn off every 1 hour and blocks all the other processes
+void controlRelay() {
+  pinMode(relayPin, OUTPUT);
+
+  digitalWrite(relayPin, LOW);
+  
+  String currentTime = getCurrentTimeString();
+  sendTelegramMessage("Relay Controle %0ADevice turned ON 🟢 %0ATime: "+currentTime); 
+
+  delay(3600000);                // Wait 1 hour (3600 sec * 1000 ms)
+  
+  digitalWrite(relayPin, HIGH);   // Turn OFF relay
+  
+  String currentTime1 = getCurrentTimeString();
+  sendTelegramMessage("Relay Controle %0ADevice turned OFF 🔴 %0ATime: "+currentTime1);
+}
+
+//function to handel the secdule true if the time is seached and false if the time isn't reached
+bool checkSchedule() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return false;
+
+  int currentHour = timeinfo.tm_hour;
+  int currentMinute = timeinfo.tm_min;
+
+  for (int i = 0; i < (sizeof(relaySchedule) / sizeof(relaySchedule[0])); i++) {
+    if (currentHour == relaySchedule[i].startHour &&
+        currentMinute == relaySchedule[i].startMinute) {
+      return true;
+    }
+  }
+  return false;
+}
+
+//Handles all the time into string
+String getCurrentTimeString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "Time not available";
+  }
+
+  char buffer[25];
+  snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d",
+           timeinfo.tm_year + 1900,
+           timeinfo.tm_mon + 1,
+           timeinfo.tm_mday,
+           timeinfo.tm_hour,
+           timeinfo.tm_min,
+           timeinfo.tm_sec);
+
+  return String(buffer);
+}
+
+
